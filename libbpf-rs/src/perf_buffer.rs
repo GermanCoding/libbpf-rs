@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 use std::slice;
 use std::time::Duration;
 
-use crate::libbpf_sys;
+use crate::{libbpf_sys, MapBase};
 use crate::util;
 use crate::Error;
 use crate::Map;
