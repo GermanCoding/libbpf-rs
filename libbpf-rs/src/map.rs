@@ -27,6 +27,7 @@ use num_enum::IntoPrimitive;
 use num_enum::TryFromPrimitive;
 use strum_macros::Display;
 
+use crate::map::map_internal::MapInternal;
 use crate::util;
 use crate::util::parse_ret_i32;
 use crate::Error;
@@ -775,6 +776,11 @@ impl Map {
     pub fn as_libbpf_bpf_map_ptr(&self) -> Option<NonNull<libbpf_sys::bpf_map>> {
         self.ptr
     }
+
+    /// Create a new [`MapHandle`] from this map.
+    pub fn to_handle(&self) -> Result<MapHandle> {
+        MapHandle::new(&self)
+    }
 }
 
 impl From<Map> for OwnedFd {
@@ -795,6 +801,398 @@ impl TryFrom<OwnedFd> for Map {
         Map::from_fd(fd)
     }
 }
+
+/// Elementary public functions for Maps
+pub trait MapBase: AsFd {
+    /// Retrieve the `Map`'s name.
+    fn name(&self) -> &str;
+
+    /// Retrieve type of the map.
+    fn map_type(&self) -> MapType;
+
+    /// Key size in bytes
+    fn key_size(&self) -> u32;
+
+    /// Value size in bytes
+    fn value_size(&self) -> u32;
+}
+
+mod map_internal {
+    use crate::map::MapBase;
+    use crate::{util, Error, MapFlags, Result};
+    use nix::errno;
+    use std::os::fd::AsRawFd;
+    use std::os::raw::c_void;
+
+    /// Non-public shared functions for Maps
+    pub trait MapInternal: MapBase {
+        /// Return the size of one value including padding for interacting with per-cpu
+        /// maps. The values are aligned to 8 bytes.
+        fn percpu_aligned_value_size(&self) -> usize {
+            util::roundup(self.value_size() as usize, 8)
+        }
+
+        /// Returns the size of the buffer needed for a lookup/update of a per-cpu map.
+        fn percpu_buffer_size(&self) -> Result<usize> {
+            let aligned_val_size = self.percpu_aligned_value_size();
+            let ncpu = crate::num_possible_cpus()?;
+            Ok(ncpu * aligned_val_size)
+        }
+
+        /// Internal function to return a value from a map into a buffer of the given size.
+        fn lookup_raw(
+            &self,
+            key: &[u8],
+            flags: MapFlags,
+            out_size: usize,
+        ) -> Result<Option<Vec<u8>>> {
+            if key.len() != self.key_size() as usize {
+                return Err(Error::InvalidInput(format!(
+                    "key_size {} != {}",
+                    key.len(),
+                    self.key_size()
+                )));
+            };
+
+            let mut out: Vec<u8> = Vec::with_capacity(out_size);
+
+            let ret = unsafe {
+                libbpf_sys::bpf_map_lookup_elem_flags(
+                    self.as_fd().as_raw_fd(),
+                    key.as_ptr() as *const c_void,
+                    out.as_mut_ptr() as *mut c_void,
+                    flags.bits,
+                )
+            };
+
+            if ret == 0 {
+                unsafe {
+                    out.set_len(out_size);
+                }
+                Ok(Some(out))
+            } else {
+                let errno = errno::errno();
+                if errno::Errno::from_i32(errno) == errno::Errno::ENOENT {
+                    Ok(None)
+                } else {
+                    Err(Error::System(errno))
+                }
+            }
+        }
+
+        /// Internal function to update a map. This does not check the length of the
+        /// supplied value.
+        fn update_raw(&self, key: &[u8], value: &[u8], flags: MapFlags) -> Result<()> {
+            if key.len() != self.key_size() as usize {
+                return Err(Error::InvalidInput(format!(
+                    "key_size {} != {}",
+                    key.len(),
+                    self.key_size()
+                )));
+            };
+
+            let ret = unsafe {
+                libbpf_sys::bpf_map_update_elem(
+                    self.as_fd().as_raw_fd(),
+                    key.as_ptr() as *const c_void,
+                    value.as_ptr() as *const c_void,
+                    flags.bits,
+                )
+            };
+
+            util::parse_ret(ret)
+        }
+    }
+}
+
+/// Represents a map or handle to a map
+pub trait BpfMap: MapInternal {
+    /// Returns map value as `Vec` of `u8`.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements.
+    ///
+    /// If the map is one of the per-cpu data structures, the function [`Map::lookup_percpu()`]
+    /// must be used.
+    fn lookup(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<u8>>> {
+        if self.map_type().is_percpu() {
+            return Err(Error::InvalidInput(format!(
+                "lookup_percpu() must be used for per-cpu maps (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        let out_size = self.value_size() as usize;
+        self.lookup_raw(key, flags, out_size)
+    }
+
+    /// Returns one value per cpu as `Vec` of `Vec` of `u8` for per per-cpu maps.
+    ///
+    /// For normal maps, [`Map::lookup()`] must be used.
+    fn lookup_percpu(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<Vec<u8>>>> {
+        if !self.map_type().is_percpu() && self.map_type() != MapType::Unknown {
+            return Err(Error::InvalidInput(format!(
+                "lookup() must be used for maps that are not per-cpu (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        let val_size = self.value_size() as usize;
+        let aligned_val_size = self.percpu_aligned_value_size();
+        let out_size = self.percpu_buffer_size()?;
+
+        let raw_res = self.lookup_raw(key, flags, out_size)?;
+        if let Some(raw_vals) = raw_res {
+            let mut out = Vec::new();
+            for chunk in raw_vals.chunks_exact(aligned_val_size) {
+                out.push(chunk[..val_size].to_vec());
+            }
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Deletes an element from the map.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements.
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        if key.len() != self.key_size() as usize {
+            return Err(Error::InvalidInput(format!(
+                "key_size {} != {}",
+                key.len(),
+                self.key_size()
+            )));
+        };
+
+        let ret = unsafe {
+            libbpf_sys::bpf_map_delete_elem(self.as_fd().as_raw_fd(), key.as_ptr() as *const c_void)
+        };
+        util::parse_ret(ret)
+    }
+
+    /// Deletes many elements in batch mode from the map.
+    ///
+    /// `keys` must have exactly [`Map::key_size()` * count] elements.
+    fn delete_batch(
+        &self,
+        keys: &[u8],
+        count: u32,
+        elem_flags: MapFlags,
+        flags: MapFlags,
+    ) -> Result<()> {
+        if keys.len() as u32 / count != self.key_size() || (keys.len() as u32) % count != 0 {
+            return Err(Error::InvalidInput(format!(
+                "batch key_size {} != {} * {}",
+                keys.len(),
+                self.key_size(),
+                count
+            )));
+        };
+
+        let opts = libbpf_sys::bpf_map_batch_opts {
+            sz: mem::size_of::<libbpf_sys::bpf_map_batch_opts>() as u64,
+            elem_flags: elem_flags.bits,
+            flags: flags.bits,
+        };
+
+        let mut count = count;
+        let ret = unsafe {
+            libbpf_sys::bpf_map_delete_batch(
+                self.as_fd().as_raw_fd(),
+                keys.as_ptr() as *const c_void,
+                (&mut count) as *mut u32,
+                &opts as *const libbpf_sys::bpf_map_batch_opts,
+            )
+        };
+        util::parse_ret(ret)
+    }
+
+    /// Same as [`Map::lookup()`] except this also deletes the key from the map.
+    ///
+    /// Note that this operation is currently only implemented in the kernel for [`MapType::Queue`]
+    /// and [`MapType::Stack`].
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements.
+    fn lookup_and_delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if key.len() != self.key_size() as usize {
+            return Err(Error::InvalidInput(format!(
+                "key_size {} != {}",
+                key.len(),
+                self.key_size()
+            )));
+        };
+
+        let mut out: Vec<u8> = Vec::with_capacity(self.value_size() as usize);
+
+        let ret = unsafe {
+            libbpf_sys::bpf_map_lookup_and_delete_elem(
+                self.as_fd().as_raw_fd(),
+                key.as_ptr() as *const c_void,
+                out.as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if ret == 0 {
+            unsafe {
+                out.set_len(self.value_size() as usize);
+            }
+            Ok(Some(out))
+        } else {
+            let errno = errno::errno();
+            if errno::Errno::from_i32(errno) == errno::Errno::ENOENT {
+                Ok(None)
+            } else {
+                Err(Error::System(errno))
+            }
+        }
+    }
+
+    /// Update an element.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements. `value` must have exactly
+    /// [`Map::value_size()`] elements.
+    ///
+    /// For per-cpu maps, [`Map::update_percpu()`] must be used.
+    fn update(&self, key: &[u8], value: &[u8], flags: MapFlags) -> Result<()> {
+        if self.map_type().is_percpu() {
+            return Err(Error::InvalidInput(format!(
+                "update_percpu() must be used for per-cpu maps (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        if value.len() != self.value_size() as usize {
+            return Err(Error::InvalidInput(format!(
+                "value_size {} != {}",
+                value.len(),
+                self.value_size()
+            )));
+        };
+
+        self.update_raw(key, value, flags)
+    }
+
+    /// Update an element in an per-cpu map with one value per cpu.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements. `value` must have one
+    /// element per cpu (see [`num_possible_cpus`][crate::num_possible_cpus])
+    /// with exactly [`Map::value_size()`] elements each.
+    ///
+    /// For per-cpu maps, [`Map::update_percpu()`] must be used.
+    fn update_percpu(&self, key: &[u8], values: &[Vec<u8>], flags: MapFlags) -> Result<()> {
+        if !self.map_type().is_percpu() && self.map_type() != MapType::Unknown {
+            return Err(Error::InvalidInput(format!(
+                "update() must be used for maps that are not per-cpu (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        if values.len() != crate::num_possible_cpus()? {
+            return Err(Error::InvalidInput(format!(
+                "number of values {} != number of cpus {}",
+                values.len(),
+                crate::num_possible_cpus()?
+            )));
+        };
+
+        let val_size = self.value_size() as usize;
+        let aligned_val_size = self.percpu_aligned_value_size();
+        let buf_size = self.percpu_buffer_size()?;
+
+        let mut value_buf = Vec::new();
+        value_buf.resize(buf_size, 0);
+
+        for (i, val) in values.iter().enumerate() {
+            if val.len() != val_size {
+                return Err(Error::InvalidInput(format!(
+                    "value size for cpu {} is {} != {}",
+                    i,
+                    val.len(),
+                    val_size
+                )));
+            }
+
+            value_buf[(i * aligned_val_size)..(i * aligned_val_size + val_size)]
+                .copy_from_slice(val);
+        }
+
+        self.update_raw(key, &value_buf, flags)
+    }
+}
+
+/// A lightweight, restricted handle to a map.
+///
+/// Some methods require working with raw bytes. You may find libraries such as
+/// [`plain`](https://crates.io/crates/plain) helpful.
+#[derive(Debug)]
+pub struct MapHandle {
+    fd: MapFd,
+    name: String,
+    ty: MapType,
+    key_size: u32,
+    value_size: u32,
+}
+
+impl MapHandle {
+    /// Create a [`MapHandle`] from a [`Map`].
+    fn new(map: &Map) -> Result<Self> {
+        let owned_fd = map
+            .fd()
+            .try_clone_to_owned()
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let fd = MapFd::Owned(owned_fd);
+        Ok(MapHandle {
+            fd,
+            name: map.name.clone(),
+            ty: map.ty,
+            key_size: map.key_size,
+            value_size: map.value_size,
+        })
+    }
+
+    /// Try cloning this handle by duplicating its underlying file descriptor.
+    pub fn try_clone(&self) -> Result<Self> {
+        let new_fd = self
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let fd = MapFd::Owned(new_fd);
+        Ok(MapHandle {
+            fd,
+            name: self.name.clone(),
+            ty: self.ty,
+            key_size: self.key_size,
+            value_size: self.value_size,
+        })
+    }
+}
+
+impl AsFd for MapHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl MapBase for MapHandle {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn map_type(&self) -> MapType {
+        self.ty
+    }
+
+    fn key_size(&self) -> u32 {
+        self.key_size
+    }
+
+    fn value_size(&self) -> u32 {
+        self.value_size
+    }
+}
+
+impl MapInternal for MapHandle {}
+impl BpfMap for MapHandle {}
 
 bitflags! {
     /// Flags to configure [`Map`] operations.
