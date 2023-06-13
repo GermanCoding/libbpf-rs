@@ -806,6 +806,44 @@ impl TryFrom<OwnedFd> for Map {
     }
 }
 
+/// A handle to a map. Handles can be duplicated and dropped.
+///
+/// Some methods require working with raw bytes. You may find libraries such as
+/// [`plain`](https://crates.io/crates/plain) helpful.
+#[derive(Debug)]
+pub struct MapHandle {
+    fd: MapFd,
+    name: String,
+    ty: MapType,
+    key_size: u32,
+    value_size: u32,
+}
+
+impl MapHandle {
+    /// Try cloning this handle by duplicating its underlying file descriptor.
+    pub fn try_clone(&self) -> Result<Self> {
+        let new_fd = self
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        let fd = MapFd::Owned(new_fd);
+        Ok(MapHandle {
+            fd,
+            name: self.name.clone(),
+            ty: self.ty,
+            key_size: self.key_size,
+            value_size: self.value_size,
+        })
+    }
+}
+
+impl AsFd for MapHandle {
+    #[inline]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 /// Interface for maps or handle to maps.
 pub trait BpfMap: AsFd {
     /// Retrieve the `Map`'s name.
