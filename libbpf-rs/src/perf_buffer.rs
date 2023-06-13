@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::libbpf_sys;
 use crate::util;
+use crate::BpfMap;
 use crate::Error;
 use crate::Map;
 use crate::MapType;

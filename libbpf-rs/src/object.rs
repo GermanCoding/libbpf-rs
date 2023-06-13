@@ -10,6 +10,7 @@ use std::ptr::{self};
 use crate::libbpf_sys;
 use crate::set_print;
 use crate::util;
+use crate::BpfMap;
 use crate::Btf;
 use crate::Error;
 use crate::Map;

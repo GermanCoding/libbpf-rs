@@ -806,6 +806,100 @@ impl TryFrom<OwnedFd> for Map {
     }
 }
 
+/// Interface for maps or handle to maps.
+pub trait BpfMap: AsFd {
+    /// Retrieve the `Map`'s name.
+    fn name(&self) -> &str;
+
+    /// Retrieve type of the map.
+    fn map_type(&self) -> MapType;
+
+    /// Key size in bytes
+    fn key_size(&self) -> u32;
+
+    /// Value size in bytes
+    fn value_size(&self) -> u32;
+
+    /// Fetch extra map information
+    fn info(&self) -> Result<MapInfo>;
+
+    /// Returns a file descriptor to the underlying map.
+    #[inline]
+    fn fd(&self) -> BorrowedFd<'_> {
+        self.as_fd()
+    }
+
+    /// Returns map value as `Vec` of `u8`.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements.
+    ///
+    /// If the map is one of the per-cpu data structures, the function [`Map::lookup_percpu()`]
+    /// must be used.
+    fn lookup(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<u8>>>;
+
+    /// Returns one value per cpu as `Vec` of `Vec` of `u8` for per per-cpu maps.
+    ///
+    /// For normal maps, [`Map::lookup()`] must be used.
+    fn lookup_percpu(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<Vec<u8>>>>;
+
+    /// Deletes an element from the map.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements.
+    fn delete(&self, key: &[u8]) -> Result<()>;
+
+    /// Deletes many elements in batch mode from the map.
+    ///
+    /// `keys` must have exactly [`Map::key_size()` * count] elements.
+    fn delete_batch(
+        &self,
+        keys: &[u8],
+        count: u32,
+        elem_flags: MapFlags,
+        flags: MapFlags,
+    ) -> Result<()>;
+
+    /// Same as [`Map::lookup()`] except this also deletes the key from the map.
+    ///
+    /// Note that this operation is currently only implemented in the kernel for [`MapType::Queue`]
+    /// and [`MapType::Stack`].
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements.
+    fn lookup_and_delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    /// Update an element.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements. `value` must have exactly
+    /// [`Map::value_size()`] elements.
+    ///
+    /// For per-cpu maps, [`Map::update_percpu()`] must be used.
+    fn update(&self, key: &[u8], value: &[u8], flags: MapFlags) -> Result<()>;
+
+    /// Update an element in an per-cpu map with one value per cpu.
+    ///
+    /// `key` must have exactly [`Map::key_size()`] elements. `value` must have one
+    /// element per cpu (see [`num_possible_cpus`][crate::num_possible_cpus])
+    /// with exactly [`Map::value_size()`] elements each.
+    ///
+    /// For per-cpu maps, [`Map::update_percpu()`] must be used.
+    fn update_percpu(&self, key: &[u8], values: &[Vec<u8>], flags: MapFlags) -> Result<()>;
+
+    /// Freeze the map as read-only from user space.
+    ///
+    /// Entries from a frozen map can no longer be updated or deleted with the
+    /// bpf() system call. This operation is not reversible, and the map remains
+    /// immutable from user space until its destruction. However, read and write
+    /// permissions for BPF programs to the map remain unchanged.
+    fn freeze(&self) -> Result<()>;
+
+    /// [Pin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
+    /// this map to bpffs.
+    fn pin<P: AsRef<Path>>(&mut self, path: P) -> Result<()>;
+
+    /// [Unpin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
+    /// this map from bpffs.
+    fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()>;
+}
+
 bitflags! {
     /// Flags to configure [`Map`] operations.
     pub struct MapFlags: u64 {

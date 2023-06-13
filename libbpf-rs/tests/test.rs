@@ -20,6 +20,7 @@ use std::ptr;
 use tempfile::NamedTempFile;
 
 use libbpf_rs::num_possible_cpus;
+use libbpf_rs::BpfMap;
 use libbpf_rs::Iter;
 use libbpf_rs::Linker;
 use libbpf_rs::Map;
