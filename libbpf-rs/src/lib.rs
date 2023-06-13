@@ -107,7 +107,6 @@ pub use crate::map::MapInfo;
 pub use crate::map::MapType;
 pub use crate::map::OpenMap;
 pub use crate::map::MapHandle;
-pub use crate::map::MapBase;
 pub use crate::map::BpfMap;
 pub use crate::object::Object;
 pub use crate::object::ObjectBuilder;

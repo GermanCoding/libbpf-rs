@@ -19,7 +19,7 @@ use scopeguard::defer;
 use std::ptr;
 use tempfile::NamedTempFile;
 
-use libbpf_rs::{BpfMap, MapBase, num_possible_cpus};
+use libbpf_rs::{BpfMap, num_possible_cpus};
 use libbpf_rs::Iter;
 use libbpf_rs::Linker;
 use libbpf_rs::Map;

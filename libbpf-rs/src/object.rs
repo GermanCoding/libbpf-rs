@@ -7,7 +7,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::ptr::{self};
 
-use crate::{libbpf_sys, MapBase};
+use crate::{BpfMap, libbpf_sys};
 use crate::set_print;
 use crate::util;
 use crate::Btf;
