@@ -237,74 +237,16 @@ impl Map {
         let key_size = unsafe { libbpf_sys::bpf_map__key_size(ptr.as_ptr()) };
         let value_size = unsafe { libbpf_sys::bpf_map__value_size(ptr.as_ptr()) };
 
-        let handle = MapHandle {
-            fd: MapFd::Borrowed(fd),
-            name,
-            ty,
-            key_size,
-            value_size,
-        };
-
         Ok(Map {
-            handle,
+            handle: MapHandle {
+                fd: MapFd::Borrowed(fd),
+                name,
+                ty,
+                key_size,
+                value_size,
+            },
             ptr: Some(ptr),
         })
-    }
-
-    /// Open a previously pinned map from its path.
-    ///
-    /// # Panics
-    /// If the path contains null bytes.
-    pub fn from_pinned_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        fn inner(path: &Path) -> Result<Map> {
-            let p = CString::new(path.as_os_str().as_bytes()).expect("path contained null bytes");
-            let fd = parse_ret_i32(unsafe {
-                // SAFETY
-                // p is never null since we allocated ourselves.
-                libbpf_sys::bpf_obj_get(p.as_ptr())
-            })?;
-            Map::from_fd(unsafe {
-                // SAFETY
-                // A file descriptor coming from the bpf_obj_get function is always suitable for
-                // ownership and can be cleaned up with close.
-                OwnedFd::from_raw_fd(fd)
-            })
-        }
-
-        inner(path.as_ref())
-    }
-
-    /// Open a loaded map from its map id.
-    pub fn from_map_id(id: u32) -> Result<Self> {
-        parse_ret_i32(unsafe {
-            // SAFETY
-            // This function is always safe to call.
-            libbpf_sys::bpf_map_get_fd_by_id(id)
-        })
-        .map(|fd| unsafe {
-            // SAFETY
-            // A file descriptor coming from the bpf_map_get_fd_by_id function is always suitable
-            // for ownership and can be cleaned up with close.
-            OwnedFd::from_raw_fd(fd)
-        })
-        .and_then(Self::from_fd)
-    }
-
-    fn from_fd(fd: OwnedFd) -> Result<Self> {
-        let info = MapInfo::new(fd.as_fd())?;
-        let handle = MapHandle::new(
-            fd,
-            info.name()?.into(),
-            info.map_type(),
-            info.info.key_size,
-            info.info.value_size,
-        );
-        Ok(Self { handle, ptr: None })
-    }
-
-    /// Fetch extra map information
-    pub fn info(&self) -> Result<MapInfo> {
-        MapInfo::new(self.as_fd())
     }
 
     /// Returns a file descriptor to the underlying map.
@@ -365,18 +307,6 @@ impl Map {
         Some(OsStr::from_bytes(path_c_str.to_bytes()))
     }
 
-    /// Freeze the map as read-only from user space.
-    ///
-    /// Entries from a frozen map can no longer be updated or deleted with the
-    /// bpf() system call. This operation is not reversible, and the map remains
-    /// immutable from user space until its destruction. However, read and write
-    /// permissions for BPF programs to the map remain unchanged.
-    pub fn freeze(&self) -> Result<()> {
-        let ret = unsafe { libbpf_sys::bpf_map_freeze(self.as_fd().as_raw_fd()) };
-
-        util::parse_ret(ret)
-    }
-
     /// Returns an iterator over keys in this map
     ///
     /// Note that if the map is not stable (stable meaning no updates or deletes) during iteration,
@@ -384,61 +314,6 @@ impl Map {
     /// iteration becomes unpredictable.
     pub fn keys(&self) -> MapKeyIter {
         MapKeyIter::new(self, self.key_size())
-    }
-
-    /// Create the bpf map standalone.
-    pub fn create<T: AsRef<str>>(
-        map_type: MapType,
-        name: Option<T>,
-        key_size: u32,
-        value_size: u32,
-        max_entries: u32,
-        opts: &libbpf_sys::bpf_map_create_opts,
-    ) -> Result<Map> {
-        let (map_name_str, map_name) = match name {
-            Some(name) => (
-                util::str_to_cstring(name.as_ref())?,
-                name.as_ref().to_string(),
-            ),
-
-            // The old version kernel don't support specifying map name, we can use 'Option::<&str>::None' for the name argument.
-            None => (util::str_to_cstring("")?, "".to_string()),
-        };
-
-        let map_name_ptr = {
-            if map_name_str.as_bytes().is_empty() {
-                null()
-            } else {
-                map_name_str.as_ptr()
-            }
-        };
-
-        let fd = unsafe {
-            libbpf_sys::bpf_map_create(
-                map_type.into(),
-                map_name_ptr,
-                key_size,
-                value_size,
-                max_entries,
-                opts,
-            )
-        };
-        let () = util::parse_ret(fd)?;
-
-        let handle = MapHandle::new(
-            unsafe {
-                // SAFETY
-                // A file descriptor coming from the bpf_map_create function is always suitable for
-                // ownership and can be cleaned up with close.
-                OwnedFd::from_raw_fd(fd)
-            },
-            map_name,
-            map_type,
-            key_size,
-            value_size,
-        );
-
-        Ok(Map { handle, ptr: None })
     }
 
     /// Attach a struct ops map
@@ -502,6 +377,10 @@ impl BpfMap for Map {
         self.handle.value_size()
     }
 
+    fn info(&self) -> Result<MapInfo> {
+        self.handle.info()
+    }
+
     fn lookup(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<u8>>> {
         self.handle.lookup(key, flags)
     }
@@ -514,7 +393,13 @@ impl BpfMap for Map {
         self.handle.delete(key)
     }
 
-    fn delete_batch(&self, keys: &[u8], count: u32, elem_flags: MapFlags, flags: MapFlags) -> Result<()> {
+    fn delete_batch(
+        &self,
+        keys: &[u8],
+        count: u32,
+        elem_flags: MapFlags,
+        flags: MapFlags,
+    ) -> Result<()> {
         self.handle.delete_batch(keys, count, elem_flags, flags)
     }
 
@@ -529,6 +414,10 @@ impl BpfMap for Map {
     fn update_percpu(&self, key: &[u8], values: &[Vec<u8>], flags: MapFlags) -> Result<()> {
         self.handle.update_percpu(key, values, flags)
     }
+
+    fn freeze(&self) -> Result<()> {
+        self.handle.freeze()
+    }
 }
 
 impl From<Map> for OwnedFd {
@@ -542,15 +431,7 @@ impl From<Map> for OwnedFd {
     }
 }
 
-impl TryFrom<OwnedFd> for Map {
-    type Error = Error;
-
-    fn try_from(fd: OwnedFd) -> Result<Self> {
-        Map::from_fd(fd)
-    }
-}
-
-/// A lightweight, restricted handle to a map.
+/// A handle to a map. Handles can be duplicated and dropped.
 ///
 /// Some methods require working with raw bytes. You may find libraries such as
 /// [`plain`](https://crates.io/crates/plain) helpful.
@@ -564,16 +445,57 @@ pub struct MapHandle {
 }
 
 impl MapHandle {
-    /// Create a [`MapHandle`] from raw data.
-    fn new(fd: OwnedFd, name: String, ty: MapType, key_size: u32, value_size: u32) -> Self {
-        let fd = MapFd::Owned(fd);
-        MapHandle {
-            fd,
-            name,
-            ty,
+    /// Create a standalone map whose lifetime is not managed by libbpf.
+    pub fn create<T: AsRef<str>>(
+        map_type: MapType,
+        name: Option<T>,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        opts: &libbpf_sys::bpf_map_create_opts,
+    ) -> Result<Self> {
+        let (map_name_str, map_name) = match name {
+            Some(name) => (
+                util::str_to_cstring(name.as_ref())?,
+                name.as_ref().to_string(),
+            ),
+
+            // The old version kernel don't support specifying map name, we can use 'Option::<&str>::None' for the name argument.
+            None => (util::str_to_cstring("")?, "".to_string()),
+        };
+
+        let map_name_ptr = {
+            if map_name_str.as_bytes().is_empty() {
+                null()
+            } else {
+                map_name_str.as_ptr()
+            }
+        };
+
+        let fd = unsafe {
+            libbpf_sys::bpf_map_create(
+                map_type.into(),
+                map_name_ptr,
+                key_size,
+                value_size,
+                max_entries,
+                opts,
+            )
+        };
+        let () = util::parse_ret(fd)?;
+
+        Ok(MapHandle {
+            fd: MapFd::Owned(unsafe {
+                // SAFETY
+                // A file descriptor coming from the bpf_map_create function is always suitable for
+                // ownership and can be cleaned up with close.
+                OwnedFd::from_raw_fd(fd)
+            }),
+            name: map_name,
+            ty: map_type,
             key_size,
             value_size,
-        }
+        })
     }
 
     /// Try cloning this handle by duplicating its underlying file descriptor.
@@ -592,6 +514,56 @@ impl MapHandle {
         })
     }
 
+    /// Open a previously pinned map from its path.
+    ///
+    /// # Panics
+    /// If the path contains null bytes.
+    pub fn from_pinned_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        fn inner(path: &Path) -> Result<MapHandle> {
+            let p = CString::new(path.as_os_str().as_bytes()).expect("path contained null bytes");
+            let fd = parse_ret_i32(unsafe {
+                // SAFETY
+                // p is never null since we allocated ourselves.
+                libbpf_sys::bpf_obj_get(p.as_ptr())
+            })?;
+            MapHandle::from_fd(unsafe {
+                // SAFETY
+                // A file descriptor coming from the bpf_obj_get function is always suitable for
+                // ownership and can be cleaned up with close.
+                OwnedFd::from_raw_fd(fd)
+            })
+        }
+
+        inner(path.as_ref())
+    }
+
+    /// Open a loaded map from its map id.
+    pub fn from_map_id(id: u32) -> Result<Self> {
+        parse_ret_i32(unsafe {
+            // SAFETY
+            // This function is always safe to call.
+            libbpf_sys::bpf_map_get_fd_by_id(id)
+        })
+        .map(|fd| unsafe {
+            // SAFETY
+            // A file descriptor coming from the bpf_map_get_fd_by_id function is always suitable
+            // for ownership and can be cleaned up with close.
+            OwnedFd::from_raw_fd(fd)
+        })
+        .and_then(Self::from_fd)
+    }
+
+    fn from_fd(fd: OwnedFd) -> Result<Self> {
+        let info = MapInfo::new(fd.as_fd())?;
+        Ok(Self {
+            fd: MapFd::Owned(fd),
+            name: info.name()?.into(),
+            ty: info.map_type(),
+            key_size: info.info.key_size,
+            value_size: info.info.value_size,
+        })
+    }
+
     /// Return the size of one value including padding for interacting with per-cpu
     /// maps. The values are aligned to 8 bytes.
     fn percpu_aligned_value_size(&self) -> usize {
@@ -606,12 +578,7 @@ impl MapHandle {
     }
 
     /// Internal function to return a value from a map into a buffer of the given size.
-    fn lookup_raw(
-        &self,
-        key: &[u8],
-        flags: MapFlags,
-        out_size: usize,
-    ) -> Result<Option<Vec<u8>>> {
+    fn lookup_raw(&self, key: &[u8], flags: MapFlags, out_size: usize) -> Result<Option<Vec<u8>>> {
         if key.len() != self.key_size() as usize {
             return Err(Error::InvalidInput(format!(
                 "key_size {} != {}",
@@ -676,6 +643,14 @@ impl AsFd for MapHandle {
     }
 }
 
+impl TryFrom<OwnedFd> for MapHandle {
+    type Error = Error;
+
+    fn try_from(fd: OwnedFd) -> Result<Self> {
+        MapHandle::from_fd(fd)
+    }
+}
+
 /// Represents a map or handle to a map
 pub trait BpfMap: AsFd {
     /// Retrieve the `Map`'s name.
@@ -689,6 +664,9 @@ pub trait BpfMap: AsFd {
 
     /// Value size in bytes
     fn value_size(&self) -> u32;
+
+    /// Fetch extra map information
+    fn info(&self) -> Result<MapInfo>;
 
     /// Returns map value as `Vec` of `u8`.
     ///
@@ -743,6 +721,14 @@ pub trait BpfMap: AsFd {
     ///
     /// For per-cpu maps, [`Map::update_percpu()`] must be used.
     fn update_percpu(&self, key: &[u8], values: &[Vec<u8>], flags: MapFlags) -> Result<()>;
+
+    /// Freeze the map as read-only from user space.
+    ///
+    /// Entries from a frozen map can no longer be updated or deleted with the
+    /// bpf() system call. This operation is not reversible, and the map remains
+    /// immutable from user space until its destruction. However, read and write
+    /// permissions for BPF programs to the map remain unchanged.
+    fn freeze(&self) -> Result<()>;
 }
 
 impl BpfMap for MapHandle {
@@ -760,6 +746,10 @@ impl BpfMap for MapHandle {
 
     fn value_size(&self) -> u32 {
         self.value_size
+    }
+
+    fn info(&self) -> Result<MapInfo> {
+        MapInfo::new(self.as_fd())
     }
 
     fn lookup(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<u8>>> {
@@ -938,6 +928,12 @@ impl BpfMap for MapHandle {
         }
 
         self.update_raw(key, &value_buf, flags)
+    }
+
+    fn freeze(&self) -> Result<()> {
+        let ret = unsafe { libbpf_sys::bpf_map_freeze(self.as_fd().as_raw_fd()) };
+
+        util::parse_ret(ret)
     }
 }
 
