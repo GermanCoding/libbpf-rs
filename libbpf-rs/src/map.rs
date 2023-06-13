@@ -836,16 +836,6 @@ impl MapHandle {
         })
     }
 
-    pub fn map_type(&self) -> MapType {
-        self.ty
-    }
-    pub fn key_size(&self) -> u32 {
-        self.key_size
-    }
-    pub fn value_size(&self) -> u32 {
-        self.value_size
-    }
-
     /// Return the size of one value including padding for interacting with per-cpu
     /// maps. The values are aligned to 8 bytes.
     fn percpu_aligned_value_size(&self) -> usize {
@@ -1029,6 +1019,232 @@ pub trait BpfMap: AsFd {
     /// [Unpin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
     /// this map from bpffs.
     fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()>;
+}
+
+impl BpfMap for MapHandle {
+    #[inline]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[inline]
+    fn map_type(&self) -> MapType {
+        self.ty
+    }
+
+    #[inline]
+    fn key_size(&self) -> u32 {
+        self.key_size
+    }
+
+    #[inline]
+    fn value_size(&self) -> u32 {
+        self.value_size
+    }
+
+    #[inline]
+    fn info(&self) -> Result<MapInfo> {
+        MapInfo::new(self.as_fd())
+    }
+
+    fn lookup(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<u8>>> {
+        if self.map_type().is_percpu() {
+            return Err(Error::InvalidInput(format!(
+                "lookup_percpu() must be used for per-cpu maps (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        let out_size = self.value_size() as usize;
+        self.lookup_raw(key, flags, out_size)
+    }
+
+    fn lookup_percpu(&self, key: &[u8], flags: MapFlags) -> Result<Option<Vec<Vec<u8>>>> {
+        if !self.map_type().is_percpu() && self.map_type() != MapType::Unknown {
+            return Err(Error::InvalidInput(format!(
+                "lookup() must be used for maps that are not per-cpu (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        let val_size = self.value_size() as usize;
+        let aligned_val_size = self.percpu_aligned_value_size();
+        let out_size = self.percpu_buffer_size()?;
+
+        let raw_res = self.lookup_raw(key, flags, out_size)?;
+        if let Some(raw_vals) = raw_res {
+            let mut out = Vec::new();
+            for chunk in raw_vals.chunks_exact(aligned_val_size) {
+                out.push(chunk[..val_size].to_vec());
+            }
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        if key.len() != self.key_size() as usize {
+            return Err(Error::InvalidInput(format!(
+                "key_size {} != {}",
+                key.len(),
+                self.key_size()
+            )));
+        };
+
+        let ret = unsafe {
+            libbpf_sys::bpf_map_delete_elem(self.fd.as_raw_fd(), key.as_ptr() as *const c_void)
+        };
+        util::parse_ret(ret)
+    }
+
+    fn delete_batch(
+        &self,
+        keys: &[u8],
+        count: u32,
+        elem_flags: MapFlags,
+        flags: MapFlags,
+    ) -> Result<()> {
+        if keys.len() as u32 / count != self.key_size() || (keys.len() as u32) % count != 0 {
+            return Err(Error::InvalidInput(format!(
+                "batch key_size {} != {} * {}",
+                keys.len(),
+                self.key_size(),
+                count
+            )));
+        };
+
+        let opts = libbpf_sys::bpf_map_batch_opts {
+            sz: mem::size_of::<libbpf_sys::bpf_map_batch_opts>() as u64,
+            elem_flags: elem_flags.bits,
+            flags: flags.bits,
+        };
+
+        let mut count = count;
+        let ret = unsafe {
+            libbpf_sys::bpf_map_delete_batch(
+                self.fd.as_raw_fd(),
+                keys.as_ptr() as *const c_void,
+                (&mut count) as *mut u32,
+                &opts as *const libbpf_sys::bpf_map_batch_opts,
+            )
+        };
+        util::parse_ret(ret)
+    }
+
+    fn lookup_and_delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if key.len() != self.key_size() as usize {
+            return Err(Error::InvalidInput(format!(
+                "key_size {} != {}",
+                key.len(),
+                self.key_size()
+            )));
+        };
+
+        let mut out: Vec<u8> = Vec::with_capacity(self.value_size() as usize);
+
+        let ret = unsafe {
+            libbpf_sys::bpf_map_lookup_and_delete_elem(
+                self.fd.as_raw_fd(),
+                self.map_key(key),
+                out.as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if ret == 0 {
+            unsafe {
+                out.set_len(self.value_size() as usize);
+            }
+            Ok(Some(out))
+        } else {
+            let errno = errno::errno();
+            if errno::Errno::from_i32(errno) == errno::Errno::ENOENT {
+                Ok(None)
+            } else {
+                Err(Error::System(errno))
+            }
+        }
+    }
+
+    fn update(&self, key: &[u8], value: &[u8], flags: MapFlags) -> Result<()> {
+        if self.map_type().is_percpu() {
+            return Err(Error::InvalidInput(format!(
+                "update_percpu() must be used for per-cpu maps (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        if value.len() != self.value_size() as usize {
+            return Err(Error::InvalidInput(format!(
+                "value_size {} != {}",
+                value.len(),
+                self.value_size()
+            )));
+        };
+
+        self.update_raw(key, value, flags)
+    }
+
+    fn update_percpu(&self, key: &[u8], values: &[Vec<u8>], flags: MapFlags) -> Result<()> {
+        if !self.map_type().is_percpu() && self.map_type() != MapType::Unknown {
+            return Err(Error::InvalidInput(format!(
+                "update() must be used for maps that are not per-cpu (type of the map is {})",
+                self.map_type(),
+            )));
+        }
+
+        if values.len() != crate::num_possible_cpus()? {
+            return Err(Error::InvalidInput(format!(
+                "number of values {} != number of cpus {}",
+                values.len(),
+                crate::num_possible_cpus()?
+            )));
+        };
+
+        let val_size = self.value_size() as usize;
+        let aligned_val_size = self.percpu_aligned_value_size();
+        let buf_size = self.percpu_buffer_size()?;
+
+        let mut value_buf = Vec::new();
+        value_buf.resize(buf_size, 0);
+
+        for (i, val) in values.iter().enumerate() {
+            if val.len() != val_size {
+                return Err(Error::InvalidInput(format!(
+                    "value size for cpu {} is {} != {}",
+                    i,
+                    val.len(),
+                    val_size
+                )));
+            }
+
+            value_buf[(i * aligned_val_size)..(i * aligned_val_size + val_size)]
+                .copy_from_slice(val);
+        }
+
+        self.update_raw(key, &value_buf, flags)
+    }
+
+    fn freeze(&self) -> Result<()> {
+        let ret = unsafe { libbpf_sys::bpf_map_freeze(self.fd.as_raw_fd()) };
+
+        util::parse_ret(ret)
+    }
+
+    fn pin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path_c = util::path_to_cstring(path)?;
+        let path_ptr = path_c.as_ptr();
+
+        let ret = unsafe { libbpf_sys::bpf_obj_pin(self.fd.as_raw_fd(), path_ptr) };
+        util::parse_ret(ret)
+    }
+
+    fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Error::Internal(format!("remove pin map failed: {e}"))),
+        }
+    }
 }
 
 bitflags! {
