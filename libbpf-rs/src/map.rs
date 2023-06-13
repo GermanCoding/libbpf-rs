@@ -201,15 +201,14 @@ impl AsRawFd for MapFd {
     }
 }
 
-/// Represents a created map.
+/// Represents a libbpf-created map.
 ///
 /// Some methods require working with raw bytes. You may find libraries such as
 /// [`plain`](https://crates.io/crates/plain) helpful.
 #[derive(Debug)]
 pub struct Map {
     handle: MapHandle,
-    // The ptr will be null if we use Map::create to create the map from the userspace side directly.
-    ptr: Option<NonNull<libbpf_sys::bpf_map>>,
+    ptr: NonNull<libbpf_sys::bpf_map>,
 }
 
 impl Map {
@@ -245,7 +244,7 @@ impl Map {
                 key_size,
                 value_size,
             },
-            ptr: Some(ptr),
+            ptr,
         })
     }
 
@@ -254,51 +253,14 @@ impl Map {
         self.as_fd()
     }
 
-    /// [Pin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
-    /// this map to bpffs.
-    pub fn pin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path_c = util::path_to_cstring(path)?;
-        let path_ptr = path_c.as_ptr();
-
-        let ret = match self.ptr {
-            Some(ptr) => unsafe { libbpf_sys::bpf_map__pin(ptr.as_ptr(), path_ptr) },
-            None => unsafe { libbpf_sys::bpf_obj_pin(self.as_fd().as_raw_fd(), path_ptr) },
-        };
-
-        util::parse_ret(ret)
-    }
-
-    /// [Unpin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
-    /// from bpffs
-    pub fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        match self.ptr {
-            Some(ptr) => {
-                let path_c = util::path_to_cstring(path)?;
-                let path_ptr = path_c.as_ptr();
-                let ret = unsafe { libbpf_sys::bpf_map__unpin(ptr.as_ptr(), path_ptr) };
-                util::parse_ret(ret)
-            }
-            None => match std::fs::remove_file(path) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(Error::Internal(format!("remove pin map failed: {e}"))),
-            },
-        }
-    }
-
     /// Returns whether map is pinned or not flag
-    pub fn is_pinned(&self) -> Result<bool> {
-        match self.ptr {
-            Some(ptr) => Ok(unsafe { libbpf_sys::bpf_map__is_pinned(ptr.as_ptr()) }),
-            None => Err(Error::InvalidInput(("No map pointer found").to_string())),
-        }
+    pub fn is_pinned(&self) -> bool {
+        unsafe { libbpf_sys::bpf_map__is_pinned(self.ptr.as_ptr()) }
     }
 
     /// Returns the pin_path if the map is pinned, otherwise, None is returned
     pub fn get_pin_path(&self) -> Option<&OsStr> {
-        let path_ptr = match self.ptr {
-            Some(ptr) => unsafe { libbpf_sys::bpf_map__pin_path(ptr.as_ptr()) },
-            None => return None,
-        };
+        let path_ptr = unsafe { libbpf_sys::bpf_map__pin_path(self.ptr.as_ptr()) };
         if path_ptr.is_null() {
             // means map is not pinned
             return None;
@@ -325,17 +287,8 @@ impl Map {
             )));
         }
 
-        let ptr = match self.ptr {
-            Some(ptr) => ptr,
-            None => {
-                return Err(Error::InvalidInput(
-                    "Cannot attach a user-created struct_ops map".to_string(),
-                ))
-            }
-        };
-
         util::create_bpf_entity_checked(|| unsafe {
-            libbpf_sys::bpf_map__attach_struct_ops(ptr.as_ptr())
+            libbpf_sys::bpf_map__attach_struct_ops(self.ptr.as_ptr())
         })
         .map(|ptr| unsafe {
             // SAFETY: the pointer came from libbpf and has been checked for errors
@@ -344,7 +297,7 @@ impl Map {
     }
 
     /// Retrieve the underlying [`libbpf_sys::bpf_map`].
-    pub fn as_libbpf_bpf_map_ptr(&self) -> Option<NonNull<libbpf_sys::bpf_map>> {
+    pub fn as_libbpf_bpf_map_ptr(&self) -> NonNull<libbpf_sys::bpf_map> {
         self.ptr
     }
 
@@ -417,6 +370,22 @@ impl BpfMap for Map {
 
     fn freeze(&self) -> Result<()> {
         self.handle.freeze()
+    }
+
+    fn pin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path_c = util::path_to_cstring(path)?;
+        let path_ptr = path_c.as_ptr();
+
+        let ret = unsafe { libbpf_sys::bpf_map__pin(self.ptr.as_ptr(), path_ptr) };
+
+        util::parse_ret(ret)
+    }
+
+    fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path_c = util::path_to_cstring(path)?;
+        let path_ptr = path_c.as_ptr();
+        let ret = unsafe { libbpf_sys::bpf_map__unpin(self.ptr.as_ptr(), path_ptr) };
+        util::parse_ret(ret)
     }
 }
 
@@ -651,7 +620,7 @@ impl TryFrom<OwnedFd> for MapHandle {
     }
 }
 
-/// Represents a map or handle to a map
+/// Interface for maps or handle to maps.
 pub trait BpfMap: AsFd {
     /// Retrieve the `Map`'s name.
     fn name(&self) -> &str;
@@ -729,6 +698,14 @@ pub trait BpfMap: AsFd {
     /// immutable from user space until its destruction. However, read and write
     /// permissions for BPF programs to the map remain unchanged.
     fn freeze(&self) -> Result<()>;
+
+    /// [Pin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
+    /// this map to bpffs.
+    fn pin<P: AsRef<Path>>(&mut self, path: P) -> Result<()>;
+
+    /// [Unpin](https://facebookmicrosites.github.io/bpf/blog/2018/08/31/object-lifetime.html#bpffs)
+    /// this map from bpffs.
+    fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()>;
 }
 
 impl BpfMap for MapHandle {
@@ -934,6 +911,22 @@ impl BpfMap for MapHandle {
         let ret = unsafe { libbpf_sys::bpf_map_freeze(self.as_fd().as_raw_fd()) };
 
         util::parse_ret(ret)
+    }
+
+    fn pin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        let path_c = util::path_to_cstring(path)?;
+        let path_ptr = path_c.as_ptr();
+
+        let ret = unsafe { libbpf_sys::bpf_obj_pin(self.as_fd().as_raw_fd(), path_ptr) };
+
+        util::parse_ret(ret)
+    }
+
+    fn unpin<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(Error::Internal(format!("remove pin map failed: {e}"))),
+        }
     }
 }
 
