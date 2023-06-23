@@ -120,7 +120,9 @@ impl OpenMap {
     }
 
     pub fn set_inner_map_fd(&mut self, inner: &Map) {
-        unsafe { libbpf_sys::bpf_map__set_inner_map_fd(self.ptr.as_ptr(), inner.fd().as_raw_fd()) };
+        unsafe {
+            libbpf_sys::bpf_map__set_inner_map_fd(self.ptr.as_ptr(), inner.as_fd().as_raw_fd())
+        };
     }
 
     pub fn set_map_extra(&mut self, map_extra: u64) -> Result<()> {
@@ -566,12 +568,6 @@ pub trait BpfMap: AsFd {
 
     /// Fetch extra map information
     fn info(&self) -> Result<MapInfo>;
-
-    /// Returns a file descriptor to the underlying map.
-    #[inline]
-    fn fd(&self) -> BorrowedFd<'_> {
-        self.as_fd()
-    }
 
     /// Returns map value as `Vec` of `u8`.
     ///
@@ -1068,7 +1064,7 @@ impl<'a> Iterator for MapKeyIter<'a> {
 
         let ret = unsafe {
             libbpf_sys::bpf_map_get_next_key(
-                self.map.fd().as_raw_fd(),
+                self.map.as_fd().as_raw_fd(),
                 prev as _,
                 self.next.as_mut_ptr() as _,
             )
